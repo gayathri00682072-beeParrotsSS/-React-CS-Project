@@ -863,8 +863,10 @@ function MatchScorecardView({ matchId, match, onBack, initialScorecardTab, onSco
   useEffect(() => {
     if (!matchId) return;
     let cancelled = false;
+    let retryTimeout: ReturnType<typeof setTimeout>;
 
-    const connectSignalR = async () => {
+    const connectSignalR = async (attempt = 0) => {
+      if (cancelled) return;
       try {
         await scoringHub.connect();
         if (cancelled) { scoringHub.disconnect(); return; }
@@ -884,8 +886,13 @@ function MatchScorecardView({ matchId, match, onBack, initialScorecardTab, onSco
         scoringHub.onWicketFallen(invalidate);
         scoringHub.onInningsBreak(invalidate);
       } catch (err) {
-        console.error('[MatchScorecardView] SignalR connect failed:', err);
+        console.error('[MatchScorecardView] SignalR connect failed (attempt ' + attempt + '):', err);
         setSignalRConnected(false);
+        // Retry with exponential backoff (max 30s), up to 5 attempts
+        if (!cancelled && attempt < 5) {
+          const delay = Math.min(2000 * Math.pow(2, attempt), 30000);
+          retryTimeout = setTimeout(() => connectSignalR(attempt + 1), delay);
+        }
       }
     };
 
@@ -893,6 +900,7 @@ function MatchScorecardView({ matchId, match, onBack, initialScorecardTab, onSco
 
     return () => {
       cancelled = true;
+      clearTimeout(retryTimeout);
       scoringHub.removeAllListeners();
       scoringHub.leaveMatch(matchId).catch(() => {});
       scoringHub.disconnect().catch(() => {});
@@ -964,7 +972,10 @@ function MatchScorecardView({ matchId, match, onBack, initialScorecardTab, onSco
     return side === 'home' ? (m?.homeTeamName || '') : (m?.awayTeamName || '');
   };
 
-  const isMatchLive = match?.status?.toLowerCase() === 'live' || match?.status?.toLowerCase() === 'inprogress' || match?.status?.toLowerCase() === 'in progress' || match?.status?.toLowerCase() === 'in_progress' || signalRConnected;
+  const isMatchLive = (() => {
+    const s = (match?.status ?? '').toLowerCase().replace(/[_\s]/g, '');
+    return ['live', 'inprogress', 'started'].includes(s) || signalRConnected;
+  })();
   const { data: scorecard, isLoading: scorecardLoading } = useQuery({
     queryKey: ['scorecard', matchId],
     queryFn: () => scoringService.getScorecard(matchId).then(r => {
@@ -982,7 +993,45 @@ function MatchScorecardView({ matchId, match, onBack, initialScorecardTab, onSco
       return sc;
     }),
     enabled: !!matchId,
-    refetchInterval: isMatchLive ? 15000 : false,
+    refetchInterval: isMatchLive ? 10000 : 30000,
+  });
+
+  // Resolve player IDs from didNotBat to names by fetching user details
+  const uuidRe = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+  const unresolvedIds: string[] = [];
+  if (scorecard?.innings) {
+    // Collect player IDs already known from batting/bowling
+    const knownIds = new Set<string>();
+    (scorecard.innings as any[]).forEach((inn: any) => {
+      (inn.batsmen ?? inn.batting ?? []).forEach((b: any) => { const id = b.batsmanId ?? b.playerId ?? b.id ?? ''; if (id) knownIds.add(id); });
+      (inn.bowlers ?? inn.bowling ?? []).forEach((b: any) => { const id = b.bowlerId ?? b.playerId ?? b.id ?? ''; if (id) knownIds.add(id); });
+    });
+    (scorecard.innings as any[]).forEach((inn: any) => {
+      const dnb = inn.didNotBat ?? inn.yetToBat ?? [];
+      if (Array.isArray(dnb)) {
+        dnb.forEach((entry: any) => {
+          const id = typeof entry === 'string' ? entry.trim() : (entry?.id ?? entry?.playerId ?? entry?.batsmanId ?? '');
+          if (id && uuidRe.test(id) && !knownIds.has(id) && !unresolvedIds.includes(id)) unresolvedIds.push(id);
+        });
+      }
+    });
+  }
+  const { data: resolvedPlayerMap } = useQuery({
+    queryKey: ['resolvePlayerNames', ...unresolvedIds],
+    queryFn: async () => {
+      const map: Record<string, string> = {};
+      await Promise.all(unresolvedIds.map(async (id) => {
+        try {
+          const res = await userService.getById(id);
+          const u = (res.data as any)?.data ?? res.data;
+          const name = u?.userName ?? u?.name ?? u?.displayName ?? (`${u?.firstName ?? ''} ${u?.lastName ?? ''}`.trim()) ?? '';
+          if (name) map[id] = name;
+        } catch { /* skip unresolvable */ }
+      }));
+      return map;
+    },
+    enabled: unresolvedIds.length > 0,
+    staleTime: 300000,
   });
 
   const tabs: { id: ScorecardTab; label: string; icon: string }[] = [
@@ -1032,7 +1081,7 @@ function MatchScorecardView({ matchId, match, onBack, initialScorecardTab, onSco
         {activeTab === 'live' && (
           <LiveTabContent matchId={matchId} scorecard={scorecard as any} scorecardLoading={scorecardLoading} />
         )}
-        {activeTab === 'scorecard' && <ScorecardTabContent scorecard={scorecard as any} loading={scorecardLoading} />}
+        {activeTab === 'scorecard' && <ScorecardTabContent scorecard={scorecard as any} loading={scorecardLoading} playerNameMap={resolvedPlayerMap} />}
         {activeTab === 'ball-by-ball' && <BallByBallTabContent scorecard={scorecard as any} matchId={matchId} />}
       </div>
     </div>
@@ -1040,7 +1089,7 @@ function MatchScorecardView({ matchId, match, onBack, initialScorecardTab, onSco
 }
 
 // -- SCORECARD TAB CONTENT --
-function ScorecardTabContent({ scorecard, loading }: { scorecard: any; loading: boolean }) {
+function ScorecardTabContent({ scorecard, loading, playerNameMap }: { scorecard: any; loading: boolean; playerNameMap?: Record<string, string> }) {
   // Map API innings data to display format
   const apiInnings: any[] = scorecard?.innings ?? [];
   const mappedInnings = apiInnings.map((inn: any, idx: number) => {
@@ -1089,6 +1138,8 @@ function ScorecardTabContent({ scorecard, loading }: { scorecard: any; loading: 
     // Build a player ID → name map from batting entries to resolve IDs in fallOfWickets string
     // Build player ID → name map from batting AND bowling entries across all innings
     const playerIdToName: Record<string, string> = {};
+    // Merge in resolved player names from parent (fetched via userService)
+    if (playerNameMap) Object.assign(playerIdToName, playerNameMap);
     apiInnings.forEach((allInn: any) => {
       (allInn.batsmen ?? allInn.batting ?? []).forEach((b: any) => {
         const id = b.batsmanId ?? b.playerId ?? b.id ?? '';
@@ -1687,9 +1738,16 @@ function LeagueLandingTab({ boardId }: { boardId: string }) {
     return m.status || 'Scheduled';
   };
 
-  const recentResults = allMatches.filter((m: any) => getEffectiveStatus(m) === 'Completed');
+  const recentResults = allMatches.filter((m: any) => {
+    const s = getEffectiveStatus(m).toLowerCase().replace(/[_\s]/g, '');
+    return s === 'completed' || s === 'complete' || s === 'finished' || s === 'ended';
+  });
   const isInProgress = (s: string) => ['Live', 'InProgress', 'In Progress', 'Started'].includes(s);
-  const upcomingMatches = allMatches.filter((m: any) => getEffectiveStatus(m) === 'Scheduled' || isInProgress(getEffectiveStatus(m)));
+  const upcomingMatches = allMatches.filter((m: any) => {
+    const s = getEffectiveStatus(m);
+    const sNorm = s.toLowerCase().replace(/[_\s]/g, '');
+    return s === 'Scheduled' || sNorm === 'scheduled' || isInProgress(s);
+  });
 
   // Fetch roster → boardName mapping from tournament teams data
   const landingTournamentIds = Array.from(new Set(allMatches.map((m: any) => m.tournamentId).filter(Boolean))) as string[];
@@ -1789,7 +1847,9 @@ function LeagueLandingTab({ boardId }: { boardId: string }) {
                     <p className="text-sm font-medium truncate">{resolveBoardName(m, 'home')} vs {resolveBoardName(m, 'away')}</p>
                   </div>
                 </div>
-                <button onClick={() => setSelectedMatch(m)} className="ml-4 px-4 py-1.5 bg-brand-bg text-white rounded text-xs font-semibold hover:bg-brand-dark transition-colors whitespace-nowrap flex-shrink-0">View Score</button>
+                <div className="flex items-center gap-2 flex-shrink-0">
+                  <button onClick={() => setSelectedMatch(m)} className="px-4 py-1.5 bg-brand-bg text-white rounded text-xs font-semibold hover:bg-brand-dark transition-colors whitespace-nowrap">View Score</button>
+                </div>
               </div>
             ))}
           </div>
@@ -1813,14 +1873,8 @@ function LeagueLandingTab({ boardId }: { boardId: string }) {
                     <p className="text-sm font-medium">{resolveBoardName(m, 'home')} vs {resolveBoardName(m, 'away')}</p>
                   </div>
                   <div className="flex items-center gap-2 flex-shrink-0">
-                    {live && (
-                      <span className="px-3 py-1 rounded-full text-xs font-medium flex items-center gap-1 bg-green-100 text-green-700">
-                        <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
-                        In Progress
-                      </span>
-                    )}
                     {live ? (
-                      <button onClick={() => setSelectedMatch(m)} className="px-4 py-1.5 bg-brand-bg text-white rounded text-xs font-semibold hover:bg-brand-dark transition-colors whitespace-nowrap">View Score</button>
+                      <button onClick={() => setSelectedMatch(m)} className="px-4 py-1.5 bg-brand-bg text-white rounded text-xs font-semibold hover:bg-brand-dark transition-colors whitespace-nowrap">Live Score</button>
                     ) : (
                       <button disabled className="px-4 py-1.5 bg-gray-300 text-gray-500 rounded text-xs font-semibold cursor-not-allowed whitespace-nowrap">View Score</button>
                     )}
