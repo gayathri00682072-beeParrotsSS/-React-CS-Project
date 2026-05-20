@@ -708,14 +708,11 @@ function LiveTabContent({ matchId, scorecard, scorecardLoading, match }: { match
     staleTime: 10000,
     refetchInterval: effectivelyLive ? 15000 : false,
     retry: 1,
+    placeholderData: (prev: any) => prev, // keep previous data visible during refetch
   });
 
-  // Keep a stable reference to deliveries so they don't flicker during refetch
-  const deliveriesRef = useRef<any[]>([]);
-  if (Array.isArray(liveDeliveriesData) && liveDeliveriesData.length > 0) {
-    deliveriesRef.current = liveDeliveriesData;
-  }
-  const stableDeliveries = deliveriesRef.current;
+  // Use the query data directly (placeholderData keeps it stable across refetches)
+  const stableDeliveries = Array.isArray(liveDeliveriesData) && liveDeliveriesData.length > 0 ? liveDeliveriesData : [];
 
   // Fetch scorer name from user profile if we only have an ID or email
   const scorerUserId = match?.appScorerId ?? match?.scorerId ?? '';
@@ -988,9 +985,11 @@ function MatchScorecardView({ matchId, match, onBack, initialScorecardTab }: { m
   const { boardId: routeBoardId } = useParams<{ boardId: string }>();
   const [searchParams, setSearchParams] = useSearchParams();
   const [activeTab, setActiveTabState] = useState<ScorecardTab>(initialScorecardTab || 'scorecard');
+  const [visitedTabs, setVisitedTabs] = useState<Set<ScorecardTab>>(new Set<ScorecardTab>([initialScorecardTab || 'scorecard']));
   const queryClient = useQueryClient();
   const setActiveTab = (tab: ScorecardTab) => {
     setActiveTabState(tab);
+    setVisitedTabs(prev => { const next = new Set(prev); next.add(tab); return next; });
     // Update URL directly so refresh preserves the tab
     const params = new URLSearchParams(searchParams);
     params.set('scorecardTab', tab);
@@ -1021,8 +1020,12 @@ function MatchScorecardView({ matchId, match, onBack, initialScorecardTab }: { m
           debounceTimer = setTimeout(() => {
             queryClient.cancelQueries({ queryKey: ['scorecard', matchId] });
             queryClient.cancelQueries({ queryKey: ['deliveries', matchId] });
+            queryClient.cancelQueries({ queryKey: ['deliveriesForLive', matchId] });
+            queryClient.cancelQueries({ queryKey: ['deliveriesForScorecard', matchId] });
             queryClient.invalidateQueries({ queryKey: ['scorecard', matchId] });
             queryClient.invalidateQueries({ queryKey: ['deliveries', matchId] });
+            queryClient.invalidateQueries({ queryKey: ['deliveriesForLive', matchId] });
+            queryClient.invalidateQueries({ queryKey: ['deliveriesForScorecard', matchId] });
             queryClient.invalidateQueries({ queryKey: ['liveMatches'] });
           }, 400);
         };
@@ -1120,6 +1123,23 @@ function MatchScorecardView({ matchId, match, onBack, initialScorecardTab }: { m
     return side === 'home' ? (m?.homeTeamName || '') : (m?.awayTeamName || '');
   };
 
+  // Fetch grounds list to resolve ground city for the match header
+  const matchGroundId = match?.groundId || '';
+  const { data: scorecardGroundCity } = useQuery({
+    queryKey: ['groundCityLookup', scorecardBoardId, matchGroundId],
+    queryFn: async () => {
+      try {
+        const r = await leagueService.getGrounds(scorecardBoardId);
+        const d = r.data as any;
+        const list = Array.isArray(d) ? d : d?.items ?? d?.data ?? d?.$values ?? [];
+        const g = list.find((g: any) => (g.groundId || g.id) === matchGroundId);
+        return g?.city || '';
+      } catch { return ''; }
+    },
+    enabled: !!scorecardBoardId && !!matchGroundId,
+    staleTime: 60000,
+  });
+
   const isMatchLive = (() => {
     const s = (match?.status ?? '').toLowerCase().replace(/[_\s]/g, '');
     return ['live', 'inprogress', 'started'].includes(s) || signalRConnected;
@@ -1213,8 +1233,12 @@ function MatchScorecardView({ matchId, match, onBack, initialScorecardTab }: { m
         </button>
         <div className="bg-white rounded-lg p-4 border">
           <p className="text-base font-bold text-gray-800">{resolveBoardName(match, 'home')} vs {resolveBoardName(match, 'away')}</p>
-          <p className="text-xs text-gray-500 mt-1">{match?.tournamentName} &bull; {formatDateTime(ensureUtc(match?.scheduledAt))}</p>
-          {match?.groundName && <p className="text-xs text-gray-400 mt-0.5">📍 {match.groundName}</p>}
+          <p className="text-xs text-gray-500 mt-1">
+            {match?.tournamentName}
+            {(scorecardGroundCity) && <> &bull; {scorecardGroundCity}</>}
+            {(match?.gameType) && <> &bull; {match.gameType}</>}
+            {(match?.groundName) && <> &bull; 📍 {match.groundName}</>}
+          </p>
           {match?.result && <p className="text-xs text-green-700 font-medium mt-1">{match.result}</p>}
         </div>
       </div>
@@ -1239,13 +1263,23 @@ function MatchScorecardView({ matchId, match, onBack, initialScorecardTab }: { m
         </div>
       </div>
 
-      {/* Tab content */}
+      {/* Tab content — keep visited tabs mounted (hidden) to preserve query cache & state */}
       <div className="mt-0">
-        {activeTab === 'live' && (
-          <LiveTabContent matchId={matchId} scorecard={scorecard as any} scorecardLoading={scorecardLoading} match={match} />
+        {visitedTabs.has('live') && (
+          <div className={activeTab !== 'live' ? 'hidden' : ''}>
+            <LiveTabContent matchId={matchId} scorecard={scorecard as any} scorecardLoading={scorecardLoading} match={match} />
+          </div>
         )}
-        {activeTab === 'scorecard' && <ScorecardTabContent scorecard={scorecard as any} loading={scorecardLoading} playerNameMap={resolvedPlayerMap} matchId={matchId} />}
-        {activeTab === 'ball-by-ball' && <BallByBallTabContent scorecard={scorecard as any} matchId={matchId} />}
+        {visitedTabs.has('scorecard') && (
+          <div className={activeTab !== 'scorecard' ? 'hidden' : ''}>
+            <ScorecardTabContent scorecard={scorecard as any} loading={scorecardLoading} playerNameMap={resolvedPlayerMap} matchId={matchId} />
+          </div>
+        )}
+        {visitedTabs.has('ball-by-ball') && (
+          <div className={activeTab !== 'ball-by-ball' ? 'hidden' : ''}>
+            <BallByBallTabContent scorecard={scorecard as any} matchId={matchId} />
+          </div>
+        )}
       </div>
     </div>
   );
@@ -1464,7 +1498,8 @@ function ScorecardTabContent({ scorecard, loading, playerNameMap, matchId }: { s
     const totalWickets = inn.totalWickets ?? inn.wickets ?? batting.filter((b: any) => b.dismissal !== 'not out' && b.dismissal !== 'batting' && b.dismissal !== '').length;
     // Prefer delivery-calculated overs over API value (legal balls only = correct per cricket rules)
     const totalOvers = deliveryBasedTotalOvers ?? inn.totalOvers ?? inn.overs ?? (bowlers.length > 0 ? Math.max(...bowlers.map((bw: any) => bw.overs ?? 0)) : 0);
-    const extras = typeof inn.extras === 'object' ? inn.extras : { total: inn.extras ?? 0, noBall: inn.noBalls ?? 0, wide: inn.wides ?? 0, legByes: inn.legByes ?? 0, byes: inn.byes ?? 0 };
+    const extrasRaw = typeof inn.extras === 'object' ? inn.extras : { total: inn.extras ?? 0, noBall: inn.noBalls ?? 0, wide: inn.wides ?? 0, legByes: inn.legByes ?? 0, byes: inn.byes ?? 0 };
+    const extras = { ...extrasRaw, penalty: extrasRaw.penalty ?? extrasRaw.penalties ?? extrasRaw.penaltyRuns ?? inn.penaltyRuns ?? inn.penalty ?? inn.penalties ?? 0 };
     const runRate = totalOvers > 0 ? +(totalRuns / totalOvers).toFixed(2) : 0;
 
     // Fall of wickets
@@ -1629,7 +1664,7 @@ function ScorecardTabContent({ scorecard, loading, playerNameMap, matchId }: { s
                   {/* Extras */}
                   <div className="flex justify-between items-center py-2 px-3 border-b border-gray-200 text-sm">
                     <span className="text-gray-600">
-                      Extras {inn.extras?.total ?? 0} (NoBall {inn.extras?.noBall ?? 0}, Wide {inn.extras?.wide ?? 0}, LegByes {inn.extras?.legByes ?? 0}, Byes {inn.extras?.byes ?? 0})
+                      Extras {inn.extras?.total ?? 0} (NoBall {inn.extras?.noBall ?? 0}, Wide {inn.extras?.wide ?? 0}, LegByes {inn.extras?.legByes ?? 0}, Byes {inn.extras?.byes ?? 0}, Penalty {inn.extras?.penalty ?? 0})
                     </span>
                     <span className="font-bold text-gray-800">
                       {inn.totalRuns}/{inn.totalWickets} ({inn.totalOvers} overs RR: {(typeof inn.runRate === 'number' ? inn.runRate : 0).toFixed(2)})
@@ -1740,6 +1775,8 @@ function BallByBallTabContent({ scorecard, matchId }: { scorecard: any; matchId:
       return results;
     },
     enabled: !!matchId && inningsNumbers.length > 0,
+    staleTime: 10000,
+    refetchInterval: 15000,
   });
 
   // Map innings with their fetched deliveries
@@ -1865,6 +1902,14 @@ function BallByBallTabContent({ scorecard, matchId }: { scorecard: any; matchId:
   });
 
   const [expandedInnings, setExpandedInnings] = useState<string[]>(mappedInnings.length > 0 ? [mappedInnings[mappedInnings.length - 1].id] : []);
+
+  // Auto-expand last innings when data becomes available (handles case where
+  // scorecard/deliveries load after initial mount, leaving expandedInnings empty)
+  useEffect(() => {
+    if (mappedInnings.length > 0 && expandedInnings.length === 0) {
+      setExpandedInnings([mappedInnings[mappedInnings.length - 1].id]);
+    }
+  }, [mappedInnings.length]);
 
   const toggleInnings = (id: string) => {
     setExpandedInnings(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
